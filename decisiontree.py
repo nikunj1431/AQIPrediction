@@ -6,10 +6,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
 from sklearn.metrics import (ConfusionMatrixDisplay, accuracy_score, f1_score,
                              mean_absolute_error, mean_squared_error,
                              precision_score, r2_score, recall_score)
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor, plot_tree
 
 POLLUTANTS = ["PM2.5", "PM10", "NO", "NO2", "NOx", "NH3", "CO", "SO2", "O3",
@@ -43,12 +46,9 @@ def load(path):
     num = [c for c in POLLUTANTS + ["AQI"] if c in df.columns]
     df = df.groupby("Day", as_index=False)[num].mean().rename(columns={"Day": "Date"})
     df = df.sort_values("Date").reset_index(drop=True)
-
-    # keep only pollutant columns that actually have data for this city
-    pols = [p for p in POLLUTANTS if p in df.columns and df[p].notna().any()]
-    for p in pols:                                   # safety net only (clean.py should have done this)
-        df[p] = df[p].fillna(df[p].median())
-
+    # Keep pollutant columns that contain at least one observed value.
+# Missing values will be imputed inside the model pipeline.
+pols = [p for p in POLLUTANTS if p in df.columns and df[p].notna().any()]
     df["Year"], df["Month"] = df["Date"].dt.year, df["Date"].dt.month
     df["Weekday"] = df["Date"].dt.weekday
     df["Season"] = df["Month"].map(lambda m: 0 if m in (12, 1, 2) else 1 if m in (3, 4, 5)
@@ -71,12 +71,24 @@ def split(df, frac=0.8):
 def run_regression(df, feats, target, name, tag):
     d = df.dropna(subset=[target])
     tr, te = split(d)
-    grid = GridSearchCV(
-        DecisionTreeRegressor(random_state=42),
-        {"max_depth": [3, 4, 6, 8, 10], "min_samples_leaf": [1, 5, 10, 20]},
-        cv=5, scoring="neg_mean_absolute_error", n_jobs=-1).fit(tr[feats], tr[target])
-    tree = grid.best_estimator_
-    pred = tree.predict(te[feats])
+model = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("tree", DecisionTreeRegressor(random_state=42))
+])
+grid = GridSearchCV(
+    model,
+    {
+        "tree__max_depth": [3, 4, 6, 8, 10],
+        "tree__min_samples_leaf": [1, 5, 10, 20]
+    },
+    cv=TimeSeriesSplit(n_splits=5),
+    scoring="neg_mean_absolute_error",
+    n_jobs=-1
+)
+grid.fit(tr[feats], tr[target])
+best_model = grid.best_estimator_
+tree = best_model.named_steps["tree"]
+pred = best_model.predict(te[feats])
     mae = mean_absolute_error(te[target], pred)
     rmse = np.sqrt(mean_squared_error(te[target], pred))
     r2 = r2_score(te[target], pred)
@@ -103,9 +115,18 @@ def run_regression(df, feats, target, name, tag):
 
 def run_classification(df, feats, tag):
     tr, te = split(df)
-    clf = DecisionTreeClassifier(max_depth=6, min_samples_leaf=5, class_weight="balanced",
-                                 random_state=42).fit(tr[feats], tr["AQI_Bucket"])
-    pred = clf.predict(te[feats])
+    clf = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("tree", DecisionTreeClassifier(
+        max_depth=6,
+        min_samples_leaf=5,
+        class_weight="balanced",
+        random_state=42
+    ))
+])
+
+clf.fit(tr[feats], tr["AQI_Bucket"])
+pred = clf.predict(te[feats])
     y = te["AQI_Bucket"]
     print("\n[AQI category] Decision Tree Classifier")
     print(f"  Accuracy ={accuracy_score(y, pred):.3f}")
